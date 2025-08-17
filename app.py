@@ -1,14 +1,17 @@
 # app.py
-import os, json, time, string, zipfile, threading, uuid, traceback
+import os, json, time, string, zipfile, threading, uuid
 from datetime import datetime
-from flask import Flask, request, jsonify, send_file
+from flask import Flask, request, jsonify, render_template
 from werkzeug.utils import secure_filename
 from werkzeug.exceptions import RequestEntityTooLarge
-from flask_cors import CORS
 
-UPLOAD_DIR = "uploads"
-JOBS_DIR = "jobs"
-EXTRACT_TMP = "extract_tmp"
+# -------------------------
+# Storage (Render disk friendly)
+# -------------------------
+DATA_DIR = os.getenv("DATA_DIR", ".")  # set to /data when you attach a persistent disk
+UPLOAD_DIR = os.path.join(DATA_DIR, "uploads")
+JOBS_DIR = os.path.join(DATA_DIR, "jobs")
+EXTRACT_TMP = os.path.join(DATA_DIR, "extract_tmp")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(JOBS_DIR, exist_ok=True)
 os.makedirs(EXTRACT_TMP, exist_ok=True)
@@ -16,25 +19,17 @@ os.makedirs(EXTRACT_TMP, exist_ok=True)
 # -------------------------
 # Config (Render friendly)
 # -------------------------
-N_WORKERS = max(1, int(os.getenv("CRACK_THREADS", str(os.cpu_count() or 2))))
+# How many cracking threads to run in parallel for brute-force
+N_WORKERS = max(1, int(os.getenv("CRACK_THREADS", str(os.cpu_count() or 2)))))
+# Optional upload cap (MiB). Render free tier ~25MB request body.
 MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "25"))
 
-app = Flask(__name__)
+# Serve static frontend + API under same origin
+app = Flask(__name__, static_folder="static", template_folder="templates")
 app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_MB * 1024 * 1024
 
-# Allow CORS for all /api/* endpoints
-CORS(app, resources={r"/api/*": {"origins": "*"}}, supports_credentials=False)
-
-# Generic after_request to ensure CORS headers present for any route
-@app.after_request
-def add_cors_headers(response):
-    response.headers.setdefault("Access-Control-Allow-Origin", "*")
-    response.headers.setdefault("Access-Control-Allow-Headers", "Content-Type,Authorization")
-    response.headers.setdefault("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
-    return response
-
 # -------------------------
-# Utilities (unchanged logic)
+# Utilities
 # -------------------------
 def now_iso():
     return datetime.utcnow().isoformat() + "Z"
@@ -51,6 +46,7 @@ def compute_total_bruteforce(charset_len, min_len, max_len):
     return total
 
 def open_zip_entries(zip_bytes, password):
+    """Try to open a zip with a password. Return True if password correct."""
     try:
         from io import BytesIO
         zf = zipfile.ZipFile(BytesIO(zip_bytes))
@@ -94,6 +90,11 @@ def get_charset(preset, custom):
     return presets.get(preset, presets["alnum"])
 
 def odometer_next_from(idx, base, start_pos):
+    """
+    Increment idx in base 'base' starting from position 'len(idx)-1' down to 'start_pos'.
+    Positions [0..start_pos-1] are treated as fixed.
+    Returns False if overflowed.
+    """
     k = len(idx) - 1
     while k >= start_pos:
         idx[k] += 1
@@ -104,191 +105,191 @@ def odometer_next_from(idx, base, start_pos):
     return False
 
 # -------------------------
-# Multi-threaded worker logic (kept same; small improvements)
+# Job Worker
 # -------------------------
-workers = {}
-locks = {}
-stop_flags = {}
+workers = {}      # job_id -> thread
+locks = {}        # job_id -> Lock
+stop_flags = {}   # job_id -> threading.Event (signals found/stop across worker threads)
 
 def run_job(job_id):
-    try:
-        lock = locks[job_id]
-        with lock:
-            job = load_job(job_id)
-            if not job:
-                return
-            job["state"] = "running"
-            job["started_at"] = job.get("started_at") or now_iso()
-            job["message"] = f"Job started with {N_WORKERS if job['mode']=='bruteforce' else 1} worker(s)."
-            save_job(job)
-
-        with open(job["zip_path"], "rb") as f:
-            zip_bytes = f.read()
-
-        last_tick = time.time()
-        tries_since_tick = 0
-
-        def update_progress(increment=1, current_candidate=None):
-            nonlocal last_tick, tries_since_tick
-            with locks[job_id]:
-                j = load_job(job_id)
-                if not j:
-                    return False
-                if j["state"] in ("stopped", "found", "error", "paused"):
-                    return False
-                j["tried"] += increment
-                j["updated_at"] = now_iso()
-                if current_candidate is not None:
-                    j["current_candidate"] = current_candidate
-                nowt = time.time()
-                tries_since_tick += increment
-                dt = nowt - last_tick
-                if dt >= 1.0:
-                    rate = human_rate(tries_since_tick, dt)
-                    j["rate"] = rate
-                    tries_since_tick = 0
-                    last_tick = nowt
-                    remain = max(0, j["total"] - j["tried"])
-                    j["eta_seconds"] = float(remain / rate) if rate > 0 else None
-                save_job(j)
-                return True
-
-        # dictionary mode (single-thread)
-        if job["mode"] == "dictionary":
-            wl_path = job.get("wordlist_path")
-            words = []
-            if wl_path and os.path.exists(wl_path):
-                with open(wl_path, "r", encoding="utf-8", errors="ignore") as f:
-                    for line in f:
-                        w = line.rstrip("\n\r")
-                        if w:
-                            words.append(w)
-            start_idx = job.get("checkpoint", {}).get("dict_index", 0)
-            for i in range(start_idx, len(words)):
-                while True:
-                    with locks[job_id]:
-                        j = load_job(job_id)
-                        if j["state"] == "paused":
-                            j["checkpoint"]["dict_index"] = i
-                            j["message"] = "Paused."
-                            save_job(j)
-                        if j["state"] in ("stopped", "error", "found"):
-                            return
-                    if load_job(job_id)["state"] != "paused":
-                        break
-                    time.sleep(0.3)
-
-                pwd = words[i]
-                ok = open_zip_entries(zip_bytes, pwd)
-                if not update_progress(1, pwd):
-                    return
-                if ok:
-                    with locks[job_id]:
-                        j = load_job(job_id)
-                        j["state"] = "found"
-                        j["password"] = pwd
-                        j["message"] = "Password found."
-                        j["updated_at"] = now_iso()
-                        save_job(j)
-                    return
-
-            with locks[job_id]:
-                j = load_job(job_id)
-                j["state"] = "stopped"
-                j["message"] = "Password not found in wordlist."
-                save_job(j)
+    """
+    Multi-threaded brute-force:
+      - Splits the keyspace by the first character index across N_WORKERS threads.
+      - Each thread iterates all lengths [min_len..max_len] where idx[0] is in its slice.
+    Dictionary mode remains single-thread.
+    """
+    lock = locks[job_id]
+    with lock:
+        job = load_job(job_id)
+        if not job:
             return
+        job["state"] = "running"
+        job["started_at"] = job.get("started_at") or now_iso()
+        job["message"] = f"Job started with {N_WORKERS if job['mode']=='bruteforce' else 1} worker(s)."
+        save_job(job)
 
-        # brute-force mode (multi-thread)
-        charset = job["charset"]
-        min_len = job["min_len"]
-        max_len = job["max_len"]
-        base = len(charset)
+    # Load zip bytes once
+    with open(job["zip_path"], "rb") as f:
+        zip_bytes = f.read()
 
-        stop_event = threading.Event()
-        stop_flags[job_id] = stop_event
+    last_tick = time.time()
+    tries_since_tick = 0
 
-        def worker_fn(worker_id):
-            for L in range(min_len, max_len + 1):
-                if stop_event.is_set():
-                    return
-                first_indices = list(range(worker_id, base, N_WORKERS))
-                for first_idx in first_indices:
-                    if stop_event.is_set():
+    def update_progress(increment=1, current_candidate=None):
+        nonlocal last_tick, tries_since_tick
+        with locks[job_id]:
+            j = load_job(job_id)
+            if not j:
+                return False
+            if j["state"] in ("stopped", "found", "error", "paused"):
+                return False
+            j["tried"] += increment
+            j["updated_at"] = now_iso()
+            if current_candidate is not None:
+                j["current_candidate"] = current_candidate
+            nowt = time.time()
+            tries_since_tick += increment
+            dt = nowt - last_tick
+            if dt >= 1.0:
+                rate = human_rate(tries_since_tick, dt)
+                j["rate"] = rate
+                tries_since_tick = 0
+                last_tick = nowt
+                remain = max(0, j["total"] - j["tried"])
+                j["eta_seconds"] = float(remain / rate) if rate > 0 else None
+            save_job(j)
+            return True
+
+    # Dictionary mode
+    if job["mode"] == "dictionary":
+        wl_path = job.get("wordlist_path")
+        words = []
+        if wl_path and os.path.exists(wl_path):
+            with open(wl_path, "r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    w = line.rstrip("\n\r")
+                    if w:
+                        words.append(w)
+        start_idx = job.get("checkpoint", {}).get("dict_index", 0)
+        for i in range(start_idx, len(words)):
+            # pause/stop checks
+            while True:
+                with locks[job_id]:
+                    j = load_job(job_id)
+                    if j["state"] == "paused":
+                        j["checkpoint"]["dict_index"] = i
+                        j["message"] = "Paused."
+                        save_job(j)
+                    if j["state"] in ("stopped", "error", "found"):
                         return
-                    idx = [0] * L
-                    idx[0] = first_idx
-                    while True:
-                        with locks[job_id]:
-                            j = load_job(job_id)
-                            if j["state"] == "paused":
-                                j["checkpoint"] = {"length": L, "indices": idx}
-                                j["message"] = "Paused."
-                                save_job(j)
-                            state = j["state"]
-                        while state == "paused":
-                            time.sleep(0.3)
-                            state = load_job(job_id)["state"]
-                        if state in ("stopped", "error", "found") or stop_event.is_set():
-                            return
+                if load_job(job_id)["state"] != "paused":
+                    break
+                time.sleep(0.3)
 
-                        candidate = "".join(charset[i] for i in idx)
-                        ok = open_zip_entries(zip_bytes, candidate)
-                        if not update_progress(1, candidate):
-                            return
-                        if ok:
-                            with locks[job_id]:
-                                jj = load_job(job_id)
-                                jj["state"] = "found"
-                                jj["password"] = candidate
-                                jj["message"] = "Password found."
-                                jj["updated_at"] = now_iso()
-                                save_job(jj)
-                            stop_event.set()
-                            return
-
-                        if L == 1:
-                            break
-                        if not odometer_next_from(idx, base, start_pos=1):
-                            break
-
-        threads = []
-        for wid in range(min(N_WORKERS, base)):
-            t = threading.Thread(target=worker_fn, args=(wid,), daemon=True)
-            threads.append(t)
-            t.start()
-
-        for t in threads:
-            t.join()
+            pwd = words[i]
+            ok = open_zip_entries(zip_bytes, pwd)
+            if not update_progress(1, pwd):
+                return
+            if ok:
+                with locks[job_id]:
+                    j = load_job(job_id)
+                    j["state"] = "found"
+                    j["password"] = pwd
+                    j["message"] = "Password found."
+                    j["updated_at"] = now_iso()
+                    save_job(j)
+                return
 
         with locks[job_id]:
             j = load_job(job_id)
-            if j["state"] != "found" and j["state"] != "stopped":
-                j["state"] = "stopped"
-                j["message"] = "Exhausted search space."
-                save_job(j)
+            j["state"] = "stopped"
+            j["message"] = "Password not found in wordlist."
+            save_job(j)
+        return
 
-    except Exception as exc:
-        # ensure errors are recorded
-        with locks.get(job_id, threading.Lock()):
-            job = load_job(job_id) or {}
-            job["state"] = "error"
-            job["message"] = "Worker crashed: " + str(exc)
-            job["traceback"] = traceback.format_exc()
-            job["updated_at"] = now_iso()
-            if "id" in job:
-                save_job(job)
+    # Brute-force mode (multi-thread)
+    charset = job["charset"]
+    min_len = job["min_len"]
+    max_len = job["max_len"]
+    base = len(charset)
+
+    stop_event = threading.Event()
+    stop_flags[job_id] = stop_event
+
+    def worker_fn(worker_id):
+        # Iterate lengths
+        for L in range(min_len, max_len + 1):
+            if stop_event.is_set():
+                return
+            # First-char slice for this worker
+            first_indices = list(range(worker_id, base, N_WORKERS))
+            for first_idx in first_indices:
+                if stop_event.is_set():
+                    return
+                idx = [0] * L
+                idx[0] = first_idx
+                # inner positions [1..L-1] roll over
+                while True:
+                    # Pause/stop/found checks
+                    with locks[job_id]:
+                        j = load_job(job_id)
+                        if j["state"] == "paused":
+                            j["checkpoint"] = {"length": L, "indices": idx}
+                            j["message"] = "Paused."
+                            save_job(j)
+                        state = j["state"]
+                    while state == "paused":
+                        time.sleep(0.3)
+                        state = load_job(job_id)["state"]
+                    if state in ("stopped", "error", "found") or stop_event.is_set():
+                        return
+
+                    candidate = "".join(charset[i] for i in idx)
+                    ok = open_zip_entries(zip_bytes, candidate)
+                    if not update_progress(1, candidate):
+                        return
+                    if ok:
+                        with locks[job_id]:
+                            jj = load_job(job_id)
+                            jj["state"] = "found"
+                            jj["password"] = candidate
+                            jj["message"] = "Password found."
+                            jj["updated_at"] = now_iso()
+                            save_job(jj)
+                        stop_event.set()
+                        return
+
+                    # advance inner odometer (positions 1..L-1)
+                    if L == 1:
+                        break
+                    if not odometer_next_from(idx, base, start_pos=1):
+                        break
+
+    # Launch workers
+    threads = []
+    for wid in range(min(N_WORKERS, base)):  # don't spawn more workers than the charset size
+        t = threading.Thread(target=worker_fn, args=(wid,), daemon=True)
+        threads.append(t)
+        t.start()
+
+    # Wait for workers
+    for t in threads:
+        t.join()
+
+    # Mark completion if not found
+    with locks[job_id]:
+        j = load_job(job_id)
+        if j["state"] != "found" and j["state"] != "stopped":
+            j["state"] = "stopped"
+            j["message"] = "Exhausted search space."
+            save_job(j)
 
 # -------------------------
-# API (unchanged endpoints, improved error handling)
+# API
 # -------------------------
 @app.errorhandler(RequestEntityTooLarge)
 def handle_file_too_large(e):
     return jsonify({"error": f"File too large. Limit is {MAX_UPLOAD_MB} MB."}), 413
-
-@app.get("/")
-def root():
-    return jsonify({"ok": True, "info": "ZIP cracker backend"})
 
 @app.get("/api/health")
 def health():
@@ -296,84 +297,92 @@ def health():
 
 @app.post("/api/jobs/start")
 def start_job():
+    """
+    form-data:
+      zip_file: (required) encrypted zip
+      mode: dictionary|bruteforce
+      wordlist: optional (.txt), only for dictionary
+      charset_preset: lower|upper|digits|lowerupper|lowerdigits|upperdigits|alnum|alnum_space|full|custom
+      custom_charset: optional (used when preset=custom)
+      min_len: int (default 1)
+      max_len: int (default 4)
+    """
+    if "zip_file" not in request.files:
+        return jsonify({"error": "zip_file is required"}), 400
+
+    job_id = uuid.uuid4().hex
+    locks[job_id] = threading.Lock()
+
+    zf = request.files["zip_file"]
+    zname = secure_filename(zf.filename or f"{job_id}.zip")
+    zip_path = os.path.join(UPLOAD_DIR, f"{job_id}__{zname}")
+    zf.save(zip_path)
+
+    mode = request.form.get("mode", "dictionary")
+    if mode not in ("dictionary", "bruteforce"):
+        return jsonify({"error": "mode must be dictionary or bruteforce"}), 400
+
+    wordlist_path = None
+    if mode == "dictionary" and "wordlist" in request.files:
+        wf = request.files["wordlist"]
+        wname = secure_filename(wf.filename or f"{job_id}.txt")
+        wordlist_path = os.path.join(UPLOAD_DIR, f"{job_id}__{wname}")
+        wf.save(wordlist_path)
+
+    charset_preset = request.form.get("charset_preset", "alnum")
+    custom_charset = request.form.get("custom_charset", "")
+    charset = get_charset(charset_preset, custom_charset)
+
     try:
-        if "zip_file" not in request.files:
-            return jsonify({"error": "zip_file is required"}), 400
+        min_len = int(request.form.get("min_len", "1"))
+        max_len = int(request.form.get("max_len", "4"))
+    except:
+        return jsonify({"error": "min_len/max_len must be integers"}), 400
+    if min_len < 1 or max_len < min_len:
+        return jsonify({"error": "invalid length range"}), 400
+    if mode == "bruteforce" and len(charset) == 0:
+        return jsonify({"error": "charset is empty"}), 400
 
-        job_id = uuid.uuid4().hex
-        locks[job_id] = threading.Lock()
-
-        zf = request.files["zip_file"]
-        zname = secure_filename(zf.filename or f"{job_id}.zip")
-        zip_path = os.path.join(UPLOAD_DIR, f"{job_id}__{zname}")
-        zf.save(zip_path)
-
-        mode = request.form.get("mode", "dictionary")
-        if mode not in ("dictionary", "bruteforce"):
-            return jsonify({"error": "mode must be dictionary or bruteforce"}), 400
-
-        wordlist_path = None
-        if mode == "dictionary" and "wordlist" in request.files:
-            wf = request.files["wordlist"]
-            wname = secure_filename(wf.filename or f"{job_id}.txt")
-            wordlist_path = os.path.join(UPLOAD_DIR, f"{job_id}__{wname}")
-            wf.save(wordlist_path)
-
-        charset_preset = request.form.get("charset_preset", "alnum")
-        custom_charset = request.form.get("custom_charset", "")
-        charset = get_charset(charset_preset, custom_charset)
-
-        try:
-            min_len = int(request.form.get("min_len", "1"))
-            max_len = int(request.form.get("max_len", "4"))
-        except:
-            return jsonify({"error": "min_len/max_len must be integers"}), 400
-        if min_len < 1 or max_len < min_len:
-            return jsonify({"error": "invalid length range"}), 400
-        if mode == "bruteforce" and len(charset) == 0:
-            return jsonify({"error": "charset is empty"}), 400
-
+    # Total count
+    if mode == "dictionary":
         total = 0
-        if mode == "dictionary":
-            if wordlist_path and os.path.exists(wordlist_path):
-                with open(wordlist_path, "r", encoding="utf-8", errors="ignore") as f:
-                    total = sum(1 for _ in f)
-            else:
-                total = 0
-        else:
-            total = compute_total_bruteforce(len(charset), min_len, max_len)
+        if wordlist_path and os.path.exists(wordlist_path):
+            with open(wordlist_path, "r", encoding="utf-8", errors="ignore") as f:
+                total = sum(1 for _ in f)
+    else:
+        total = compute_total_bruteforce(len(charset), min_len, max_len)
 
-        job = {
-            "id": job_id,
-            "state": "queued",
-            "mode": mode,
-            "zip_path": zip_path,
-            "wordlist_path": wordlist_path,
-            "charset": charset if mode == "bruteforce" else "",
-            "min_len": min_len if mode == "bruteforce" else 0,
-            "max_len": max_len if mode == "bruteforce" else 0,
-            "created_at": now_iso(),
-            "updated_at": now_iso(),
-            "started_at": None,
-            "finished_at": None,
-            "tried": 0,
-            "total": total,
-            "rate": 0.0,
-            "eta_seconds": None,
-            "current_candidate": "",
-            "password": None,
-            "message": "Queued",
-            "checkpoint": {}
-        }
-        save_job(job)
+    # Prepare job object
+    job = {
+        "id": job_id,
+        "state": "queued",
+        "mode": mode,
+        "zip_path": zip_path,
+        "wordlist_path": wordlist_path,
+        "charset": charset if mode == "bruteforce" else "",
+        "min_len": min_len if mode == "bruteforce" else 0,
+        "max_len": max_len if mode == "bruteforce" else 0,
+        "created_at": now_iso(),
+        "updated_at": now_iso(),
+        "started_at": None,
+        "finished_at": None,
+        "tried": 0,
+        "total": total,
+        "rate": 0.0,
+        "eta_seconds": None,
+        "current_candidate": "",
+        "password": None,
+        "message": "Queued",
+        "checkpoint": {}
+    }
+    save_job(job)
 
-        t = threading.Thread(target=run_job, args=(job_id,), daemon=True)
-        workers[job_id] = t
-        t.start()
+    # Launch worker thread (spawns N_WORKERS internal threads for brute-force)
+    t = threading.Thread(target=run_job, args=(job_id,), daemon=True)
+    workers[job_id] = t
+    t.start()
 
-        return jsonify({"job_id": job_id})
-    except Exception as exc:
-        return jsonify({"error": "internal_server_error", "detail": str(exc)}), 500
+    return jsonify({"job_id": job_id})
 
 @app.get("/api/jobs/<job_id>/status")
 def job_status(job_id):
@@ -442,10 +451,23 @@ def job_stop(job_id):
         job["message"] = "Stopped by user."
         job["updated_at"] = now_iso()
         save_job(job)
+    # trip the stop event so worker threads exit
     ev = stop_flags.get(job_id)
     if ev:
         ev.set()
     return jsonify({"ok": True})
 
+# -------------------------
+# Frontend routes (same origin)
+# -------------------------
+@app.get("/")
+def home():
+    return render_template("index.html")
+
+@app.get("/health")
+def ui_health():
+    return f"OK {now_iso()}"
+
 if __name__ == "__main__":
+    # Local dev only; on Render use gunicorn (Procfile)
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")))
